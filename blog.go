@@ -2,35 +2,31 @@ package main
 
 import (
 	"encoding/base64"
-	"fmt"
 	"html/template"
-	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
 
-	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
-	"gopkg.in/authboss.v0"
-	_ "gopkg.in/authboss.v0/auth"
-	_ "gopkg.in/authboss.v0/confirm"
-	_ "gopkg.in/authboss.v0/lock"
-	aboauth "gopkg.in/authboss.v0/oauth2"
-	_ "gopkg.in/authboss.v0/recover"
-	_ "gopkg.in/authboss.v0/register"
-	_ "gopkg.in/authboss.v0/remember"
+	"github.com/gin-gonic/gin/render"
 
-	"github.com/aarondl/tpl"
-	"github.com/gorilla/mux"
-	"github.com/gorilla/schema"
+	// plugin package
+	"github.com/gin-gonic/gin"
 	"github.com/gorilla/securecookie"
 	"github.com/gorilla/sessions"
-	"github.com/justinas/alice"
 	"github.com/justinas/nosurf"
+	"gopkg.in/authboss.v0"
+	// register authboss register module
+	_ "gopkg.in/authboss.v0/register"
+	// register authboss login module
+	_ "gopkg.in/authboss.v0/auth"
+	// to confirm authboss
+	_ "gopkg.in/authboss.v0/confirm"
+	// to lock user after N authentication failures
+	_ "gopkg.in/authboss.v0/lock"
+	_ "gopkg.in/authboss.v0/recover"
+	_ "gopkg.in/authboss.v0/remember"
 )
 
 var funcs = template.FuncMap{
@@ -40,50 +36,25 @@ var funcs = template.FuncMap{
 	"yield": func() string { return "" },
 }
 
-var (
-	ab        = authboss.New()
-	database  = NewMemStorer()
-	templates = tpl.Must(tpl.Load("views", "views/partials", "layout.html.tpl", funcs))
-	schemaDec = schema.NewDecoder()
-)
+var ab *authboss.Authboss
 
-func setupAuthboss() {
-	ab.Storer = database
-	ab.OAuth2Storer = database
-	ab.MountPath = "/auth"
-	ab.ViewsPath = "ab_views"
-	ab.RootURL = `http://localhost:3000`
-
-	ab.LayoutDataMaker = layoutData
-
-	ab.OAuth2Providers = map[string]authboss.OAuth2Provider{
-		"google": authboss.OAuth2Provider{
-			OAuth2Config: &oauth2.Config{
-				ClientID:     ``,
-				ClientSecret: ``,
-				Scopes:       []string{`profile`, `email`},
-				Endpoint:     google.Endpoint,
-			},
-			Callback: aboauth.Google,
-		},
+func layoutData(w http.ResponseWriter, r *http.Request) authboss.HTMLData {
+	currentUserName := ""
+	userInter, err := ab.CurrentUser(w, r)
+	if userInter != nil && err == nil {
+		currentUserName = userInter.(*User).Name
 	}
 
-	b, err := ioutil.ReadFile(filepath.Join("views", "layout.html.tpl"))
-	if err != nil {
-		panic(err)
+	return authboss.HTMLData{
+		"loggedin":               userInter != nil,
+		"username":               "username",
+		authboss.FlashSuccessKey: ab.FlashSuccess(w, r),
+		authboss.FlashErrorKey:   ab.FlashError(w, r),
+		"current_user_name":      currentUserName,
 	}
-	ab.Layout = template.Must(template.New("layout").Funcs(funcs).Parse(string(b)))
+}
 
-	ab.XSRFName = "csrf_token"
-	ab.XSRFMaker = func(_ http.ResponseWriter, r *http.Request) string {
-		return nosurf.Token(r)
-	}
-
-	ab.CookieStoreMaker = NewCookieStorer
-	ab.SessionStoreMaker = NewSessionStorer
-
-	ab.Mailer = authboss.LogMailer(os.Stdout)
-
+func initAuthBossPolicy(ab *authboss.Authboss) {
 	ab.Policies = []authboss.Validator{
 		authboss.Rules{
 			FieldName:       "email",
@@ -98,212 +69,72 @@ func setupAuthboss() {
 			AllowWhitespace: false,
 		},
 	}
+}
 
-	if err := ab.Init(); err != nil {
-		log.Fatal(err)
+func initAuthBossLayout(ab *authboss.Authboss, r *gin.Engine) {
+	if os.Getenv(gin.ENV_GIN_MODE) == gin.ReleaseMode {
+		ab.Layout = r.HTMLRender.(render.HTMLProduction).Template.Funcs(funcs).Lookup("authboss.tmpl")
+	} else {
+		html := r.HTMLRender.(render.HTMLDebug).Instance("authboss.tmpl", nil).(render.HTML)
+		ab.Layout = html.Template.Funcs(template.FuncMap(funcs)).Lookup("authboss.tmpl")
+		// ab.Layout.ExecuteTemplate(os.Stdout, "layout.html.tpl", nil)
 	}
 }
 
-func main() {
-	// Initialize Sessions and Cookies
-	// Typically gorilla securecookie and sessions packages require
-	// highly random secret keys that are not divulged to the public.
-	//
-	// In this example we use keys generated one time (if these keys ever become
-	// compromised the gorilla libraries allow for key rotation, see gorilla docs)
-	// The keys are 64-bytes as recommended for HMAC keys as per the gorilla docs.
-	//
-	// These values MUST be changed for any new project as these keys are already "compromised"
-	// as they're in the public domain, if you do not change these your application will have a fairly
-	// wide-opened security hole. You can generate your own with the code below, or using whatever method
-	// you prefer:
-	//
-	//    func main() {
-	//        fmt.Println(base64.StdEncoding.EncodeToString(securecookie.GenerateRandomKey(64)))
-	//    }
-	//
-	// We store them in base64 in the example to make it easy if we wanted to move them later to
-	// a configuration environment var or file.
+var database = NewMemStorer()
+
+func initAuthBossParam(r *gin.Engine) *authboss.Authboss {
+	ab := authboss.New()
+	ab.Storer = database
+	ab.CookieStoreMaker = NewCookieStorer
+	ab.SessionStoreMaker = NewSessionStorer
+	ab.ViewsPath = filepath.Join("ab_views")
+	//ab.RootURL = `http://localhost:5567`
+
+	ab.LayoutDataMaker = layoutData
+
+	ab.MountPath = "/auth"
+	ab.LogWriter = os.Stdout
+
+	ab.XSRFName = "csrf_token"
+	ab.XSRFMaker = func(_ http.ResponseWriter, r *http.Request) string {
+		return nosurf.Token(r)
+	}
+
+	initAuthBossLayout(ab, r)
+	ab.Mailer = authboss.LogMailer(os.Stdout)
+	initAuthBossPolicy(ab)
+
+	if err := ab.Init(); err != nil {
+		// Handle error, don't let program continue to run
+		log.Fatalln(err)
+	}
+	return ab
+}
+
+func initAuthBossRoute(r *gin.Engine) {
 	cookieStoreKey, _ := base64.StdEncoding.DecodeString(`NpEPi8pEjKVjLGJ6kYCS+VTCzi6BUuDzU0wrwXyf5uDPArtlofn2AG6aTMiPmN3C909rsEWMNqJqhIVPGP3Exg==`)
 	sessionStoreKey, _ := base64.StdEncoding.DecodeString(`AbfYwmmt8UCwUuhd9qvfNA9UCuN1cVcKJN1ofbiky6xCyyBj20whe40rJa3Su0WOWLWcPpO1taqJdsEI/65+JA==`)
 	cookieStore = securecookie.New(cookieStoreKey, nil)
 	sessionStore = sessions.NewCookieStore(sessionStoreKey)
+	ab = initAuthBossParam(r)
+	r.Any("/auth/*w", gin.WrapH(ab.NewRouter()))
+}
 
-	// Initialize ab.
-	setupAuthboss()
+func main() {
 
-	// Set up our router
-	schemaDec.IgnoreUnknownKeys(true)
-	mux := mux.NewRouter()
+	r := gin.Default()
 
-	// Routes
-	gets := mux.Methods("GET").Subrouter()
-	posts := mux.Methods("POST").Subrouter()
+	r.Static("resources", "./resources")
 
-	mux.PathPrefix("/auth").Handler(ab.NewRouter())
+	r.LoadHTMLGlob("resources/views/gin-gonic/*")
 
-	gets.Handle("/blogs/new", authProtect(newblog))
-	gets.Handle("/blogs/{id}/edit", authProtect(edit))
-	gets.HandleFunc("/blogs", index)
-	gets.HandleFunc("/", index)
-
-	posts.Handle("/blogs/{id}/edit", authProtect(update))
-	posts.Handle("/blogs/new", authProtect(create))
-
-	// This should actually be a DELETE but I can't be bothered to make a proper
-	// destroy link using javascript atm.
-	gets.HandleFunc("/blogs/{id}/destroy", destroy)
-
-	mux.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-		io.WriteString(w, "Not found")
+	r.GET("/", func(c *gin.Context) {
+		data := layoutData(c.Writer, c.Request)
+		c.HTML(http.StatusOK, "index.tmpl", data)
 	})
 
-	// Set up our middleware chain
-	stack := alice.New(logger, nosurfing, ab.ExpireMiddleware).Then(mux)
+	initAuthBossRoute(r)
 
-	// Start the server
-	port := os.Getenv("PORT")
-	if len(port) == 0 {
-		port = "3000"
-	}
-	log.Println(http.ListenAndServe("localhost:"+port, stack))
-}
-
-func layoutData(w http.ResponseWriter, r *http.Request) authboss.HTMLData {
-	currentUserName := ""
-	userInter, err := ab.CurrentUser(w, r)
-	if userInter != nil && err == nil {
-		currentUserName = userInter.(*User).Name
-	}
-
-	return authboss.HTMLData{
-		"loggedin":               userInter != nil,
-		"username":               "",
-		authboss.FlashSuccessKey: ab.FlashSuccess(w, r),
-		authboss.FlashErrorKey:   ab.FlashError(w, r),
-		"current_user_name":      currentUserName,
-	}
-}
-
-func index(w http.ResponseWriter, r *http.Request) {
-	data := layoutData(w, r).MergeKV("posts", blogs)
-	mustRender(w, r, "index", data)
-}
-
-func newblog(w http.ResponseWriter, r *http.Request) {
-	data := layoutData(w, r).MergeKV("post", Blog{})
-	mustRender(w, r, "new", data)
-}
-
-var nextID = len(blogs) + 1
-
-func create(w http.ResponseWriter, r *http.Request) {
-	err := r.ParseForm()
-	if badRequest(w, err) {
-		return
-	}
-
-	// TODO: Validation
-
-	var b Blog
-	if badRequest(w, schemaDec.Decode(&b, r.PostForm)) {
-		return
-	}
-
-	b.ID = nextID
-	nextID++
-	b.Date = time.Now()
-	b.AuthorID = "Zeratul"
-
-	blogs = append(blogs, b)
-
-	http.Redirect(w, r, "/", http.StatusFound)
-}
-
-func edit(w http.ResponseWriter, r *http.Request) {
-	id, ok := blogID(w, r)
-	if !ok {
-		return
-	}
-
-	data := layoutData(w, r).MergeKV("post", blogs.Get(id))
-	mustRender(w, r, "edit", data)
-}
-
-func update(w http.ResponseWriter, r *http.Request) {
-	err := r.ParseForm()
-	if badRequest(w, err) {
-		return
-	}
-
-	id, ok := blogID(w, r)
-	if !ok {
-		return
-	}
-
-	// TODO: Validation
-
-	var b = blogs.Get(id)
-	if badRequest(w, schemaDec.Decode(b, r.PostForm)) {
-		return
-	}
-
-	b.Date = time.Now()
-
-	http.Redirect(w, r, "/", http.StatusFound)
-}
-
-func destroy(w http.ResponseWriter, r *http.Request) {
-	id, ok := blogID(w, r)
-	if !ok {
-		return
-	}
-
-	blogs.Delete(id)
-
-	http.Redirect(w, r, "/", http.StatusFound)
-}
-
-func blogID(w http.ResponseWriter, r *http.Request) (int, bool) {
-	vars := mux.Vars(r)
-	str := vars["id"]
-
-	id, err := strconv.Atoi(str)
-	if err != nil {
-		log.Println("Error parsing blog id:", err)
-		http.Redirect(w, r, "/", http.StatusFound)
-		return 0, false
-	}
-
-	if id <= 0 {
-		http.Redirect(w, r, "/", http.StatusFound)
-		return 0, false
-	}
-
-	return id, true
-}
-
-func mustRender(w http.ResponseWriter, r *http.Request, name string, data authboss.HTMLData) {
-	data.MergeKV("csrf_token", nosurf.Token(r))
-	err := templates.Render(w, name, data)
-	if err == nil {
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/plain")
-	w.WriteHeader(http.StatusInternalServerError)
-	fmt.Fprintln(w, "Error occurred rendering template:", err)
-}
-
-func badRequest(w http.ResponseWriter, err error) bool {
-	if err == nil {
-		return false
-	}
-
-	w.Header().Set("Content-Type", "text/plain")
-	w.WriteHeader(http.StatusBadRequest)
-	fmt.Fprintln(w, "Bad request:", err)
-
-	return true
+	r.Run(":3000")
 }
